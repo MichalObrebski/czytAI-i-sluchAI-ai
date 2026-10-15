@@ -1,4 +1,4 @@
-# czytAI-i-sluchAI-ai
+# czytAI-i-słuchAI-ai
 [wizia projektu](vision.md)
 
 autorzy: Michał Obrębski, Tymon Piwowarski
