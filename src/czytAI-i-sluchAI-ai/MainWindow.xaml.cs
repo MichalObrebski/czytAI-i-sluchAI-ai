@@ -17,7 +17,7 @@ namespace czytAI_i_sluchAI_ai
         private const uint ModControl = 0x0002;
         private const uint Vk0 = 0x30;
         private const int WmHotKey = 0x0312;
-        private const string PresetPrompt = "Read my screen, figure out the vibe of the text, and play a specific song title that fits perfectly as background music.";
+        private const string PresetPrompt = "Read the lecture on my screen and determine its core subject and vibe. To give me maximum immersion while I consume the text, play a specific, perfectly fitting background song.";
 
         private HwndSource? _windowSource;
         private LocalAgent? _agent;
