@@ -23,7 +23,7 @@ public sealed class LocalAgent
         string clientId,
         string clientSecret,
         string endpoint = "http://localhost:11434/v1/chat/completions",
-        string model = "llama3.1")
+        string model = "granite4.2:3b")
     {
         using var authClient = new HttpClient();
         var tokenRequest = new HttpRequestMessage(HttpMethod.Post, "https://accounts.spotify.com/api/token")
@@ -61,7 +61,7 @@ public sealed class LocalAgent
     public LocalAgent(
         IEnumerable<IAgentTool> tools,
         string endpoint = "http://localhost:11434/v1/chat/completions",
-        string model = "llama3.1")
+        string model = "granite4.2:3b")
     {
         _tools = tools.ToList();
         _endpoint = endpoint;
@@ -70,15 +70,29 @@ public sealed class LocalAgent
 
         string systemPrompt = @"You are an intelligent, concise desktop AI assistant with access to Spotify and screen-reading capabilities. Use your tools naturally only when the user's request requires them.
 
+VIBE-TO-SONG REFERENCE LIBRARY:
+When matching a song to the user's screen or requested mood, strongly prefer using one of these proven tracks. Match the keywords to the text you read:
+
+- Nature / Forest / Calm / Refreshing -> 'Holocene', 'Clair de Lune', 'Sunrise', 'Bloom', 'Wildflower'
+- Epic / Battle / War / History / Action -> 'The Ecstasy of Gold', 'O Fortuna', 'Now We Are Free', 'Immigrant Song', 'Conquest of Paradise'
+- Sci-Fi / Space / Cyberpunk / Tech / Future -> 'Blade Runner Blues', 'Cornfield Chase', 'Nightcall', 'Starboy', 'Genesis'
+- Mystery / Suspense / Detective / Dark / Thriller -> 'Teardrop', 'Way Down We Go', 'Red Right Hand', 'Bury a Friend', 'Paint It, Black'
+- Romance / Drama / Poetry / Emotional -> 'At Last', 'Sparks', 'Perfect', 'Make You Feel My Love', 'Yellow'
+- Focus / Studying / Non-Fiction / Coding -> 'Weightless', 'Snowfall', 'Day One', 'Nuvole Bianche', 'Avril 14th'
+- Happy / Upbeat / Comedy / Casual / Sunny -> 'Uptown Funk', 'Walking On Sunshine', 'Happy', 'Mr. Blue Sky', 'Levitating'
+- Sad / Melancholy / Tragedy / Grief -> 'Someone Like You', 'Hurt', 'Fix You', 'The Sound of Silence', 'Mad World'
+- Horror / Scary / Macabre / Gothic -> 'Tubular Bells', 'Halloween Theme', 'Suspiria', 'Lullaby', 'Psycho Theme'
+- Fantasy / Magic / Mythology / Adventure -> 'Concerning Hobbits', 'The Dragonborn Comes', 'Toss A Coin To Your Witcher', 'Hedwig's Theme', 'May It Be'
+
 TOOL SELECTION GUIDELINES:
-- `play_spotify_song`: Call this to play music. IMPORTANT: The ONLY parameter you can send is `song_title`. Never send 'genre', 'mood', or anything else. Deduce a fitting real song title silently, and pass ONLY that specific title to the tool.
+- `play_spotify_song`: Call this to play music. IMPORTANT: The ONLY parameter you can send is `song_title`. Never send 'genre', 'mood', or anything else. Use the Vibe-to-Song Reference Library to silently pick a specific title, and pass ONLY that exact title to the tool.
 - `read_screen_text`: Call this ONLY when the user references their current screen, document, or active window (e.g., 'this book', 'what am I reading'). Do not use this for general conversation.
 - `search_spotify_track`: Call this only to answer trivia or track details without playing the song.
 
 CHAINING ACTIONS (CRITICAL):
 When the user asks you to read the screen and play a fitting song based on it, you MUST perform a **Two-Step Tool Chain**:
 1. First, call `read_screen_text` and wait for the system response.
-2. Once you receive the screen text, you MUST immediately make a **second tool call** to `play_spotify_song` using a valid `song_title` derived from that text. Never stop after just reading the screen.
+2. Once you receive the screen text, identify its keywords, find a matching song from the Vibe Library, and immediately make a **second tool call** to `play_spotify_song` using that `song_title`. Never stop after just reading the screen.
 
 CONVERSATION STYLE:
 - Be highly concise. If a song is played via tool call, just reply: 'Playing [Song Name].'
@@ -89,6 +103,12 @@ CONVERSATION STYLE:
 
     public async Task<string> SendAsync(string userPrompt, CancellationToken cancellationToken = default)
     {
+        var systemMessage = _messages.FirstOrDefault(m => m.Role == "system");
+        _messages.Clear();
+        if (systemMessage != null)
+        {
+            _messages.Add(systemMessage);
+        }
         _messages.Add(new ChatMessage("user", userPrompt));
 
         // The while loop allows the AI to call a tool, read the result, and call ANOTHER tool.
@@ -180,27 +200,66 @@ CONVERSATION STYLE:
         var message = response.RootElement
             .GetProperty("choices")[0]
             .GetProperty("message");
+
         var content = message.TryGetProperty("content", out var contentElement)
             && contentElement.ValueKind != JsonValueKind.Null
             ? contentElement.GetString()
             : null;
 
-        if (!message.TryGetProperty("tool_calls", out var toolCalls)
-            || toolCalls.GetArrayLength() == 0)
+        // 1. Standard API Tool Call Check (The Happy Path)
+        if (message.TryGetProperty("tool_calls", out var toolCalls) && toolCalls.GetArrayLength() > 0)
         {
-            return new ChatMessage("assistant", content);
+            var toolCall = toolCalls[0];
+            var function = toolCall.GetProperty("function");
+            return new ChatMessage(
+                "assistant",
+                content,
+                new ToolCall(
+                    toolCall.GetProperty("id").GetString() ?? "tool-call",
+                    function.GetProperty("name").GetString()
+                        ?? throw new InvalidOperationException("The model returned a tool call without a name."),
+                    ParseArguments(function.GetProperty("arguments"))));
         }
 
-        var toolCall = toolCalls[0];
-        var function = toolCall.GetProperty("function");
-        return new ChatMessage(
-            "assistant",
-            content,
-            new ToolCall(
-                toolCall.GetProperty("id").GetString() ?? "tool-call",
-                function.GetProperty("name").GetString()
-                    ?? throw new InvalidOperationException("The model returned a tool call without a name."),
-                ParseArguments(function.GetProperty("arguments"))));
+        // 2. Fallback Parser: Catch leaked JSON in the text response
+        if (!string.IsNullOrWhiteSpace(content) && content.Trim().StartsWith("{") && content.Contains("play_spotify_song"))
+        {
+            try
+            {
+                using var leakedJson = JsonDocument.Parse(content.Trim());
+                var root = leakedJson.RootElement;
+
+                string? songTitle = null;
+
+                // Handle the specific hallucinated formats ("params" or "parameters")
+                if (root.TryGetProperty("params", out var p) && p.TryGetProperty("song_title", out var st1))
+                    songTitle = st1.GetString();
+                else if (root.TryGetProperty("parameters", out var p2) && p2.TryGetProperty("song_title", out var st2))
+                    songTitle = st2.GetString();
+
+                if (!string.IsNullOrEmpty(songTitle))
+                {
+                    // Create a valid arguments JSON element for the execution loop
+                    string validArgs = $"{{\"song_title\": \"{songTitle}\"}}";
+                    using var argsDoc = JsonDocument.Parse(validArgs);
+
+                    return new ChatMessage(
+                        "assistant",
+                        $"Playing '{songTitle}'.", // Replace the ugly JSON with a clean text response
+                        new ToolCall(
+                            "fallback-tool-call",
+                            "play_spotify_song",
+                            argsDoc.RootElement.Clone()));
+                }
+            }
+            catch
+            {
+                // If it fails to parse, ignore it and let the raw text fall through to the user
+            }
+        }
+
+        // 3. Normal conversational text
+        return new ChatMessage("assistant", content);
     }
 
     private static JsonElement ParseArguments(JsonElement arguments)
